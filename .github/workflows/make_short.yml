@@ -1,0 +1,107 @@
+name: Make Short
+
+# Triggered remotely (workflow_dispatch) with the exact same request JSON
+# shape your PC's queue/ files already use: {topic, upload, privacy,
+# publish_slot, script}. One run builds one video end-to-end and, on
+# success, commits its result to results/<run-id>.json so it can be read
+# back afterward -- mirroring how watcher.py writes to results/ locally.
+on:
+  workflow_dispatch:
+    inputs:
+      request_json:
+        description: "Full request JSON (same schema as a queue/*.json file)"
+        required: true
+        type: string
+
+# Runs one at a time, in the order they were dispatched -- same behavior as
+# the local watcher.py polling loop, and avoids two runs' results commits
+# racing against each other.
+concurrency:
+  group: make-short-serial
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies (ffmpeg, fluidsynth, caption font)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fluidsynth fonts-dejavu-core
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write config.json and YouTube credentials from repo secrets
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_TOKEN: ${{ secrets.YOUTUBE_TOKEN }}
+        run: |
+          python - <<'PY'
+          import json, os
+
+          config = {
+              "openrouter_api_key": os.environ["OPENROUTER_API_KEY"],
+              "openrouter_model": os.environ.get("OPENROUTER_MODEL") or "inclusionai/ling-3.0-flash-fin:free",
+              "soundfont_path": "soundfonts/TimGM6mb.sf2",
+              "fluidsynth_bin": "fluidsynth",
+              "pexels_api_key": os.environ.get("PEXELS_API_KEY", ""),
+              "pixabay_api_key": os.environ.get("PIXABAY_API_KEY", ""),
+              "music_library_dir": "music_library",  # intentionally absent on
+              # the runner -- prepare_track() sees no directory and raises
+              # FileNotFoundError, and run_pipeline() falls back to the
+              # built-in procedural composer (lib/music_composer.py). Your
+              # Incompetech mp3 pack stays local-only; it's too large to ship
+              # in this repo and isn't needed for the fallback to work.
+              "client_secret_path": "client_secret.json",
+              "token_path": "token.json",
+          }
+          with open("config.json", "w", encoding="utf-8") as f:
+              json.dump(config, f)
+
+          with open("client_secret.json", "w", encoding="utf-8") as f:
+              f.write(os.environ["YOUTUBE_CLIENT_SECRET"])
+          with open("token.json", "w", encoding="utf-8") as f:
+              f.write(os.environ["YOUTUBE_TOKEN"])
+          PY
+
+      - name: Write the request file
+        env:
+          REQUEST_JSON: ${{ inputs.request_json }}
+        run: |
+          python -c "
+          import json, os
+          data = json.loads(os.environ['REQUEST_JSON'])  # fail fast if malformed
+          with open('request.json', 'w', encoding='utf-8') as f:
+              json.dump(data, f)
+          "
+
+      - name: Run the pipeline
+        id: run
+        run: |
+          mkdir -p results
+          RUN_ID="run_${{ github.run_id }}_${{ github.run_attempt }}"
+          echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+          python make_short.py --request-file request.json --result-file "results/${RUN_ID}.json"
+
+      - name: Commit the result
+        if: always()
+        run: |
+          git config user.name "faceless-shorts-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add results/
+          git diff --cached --quiet || (git commit -m "Result: ${{ steps.run.outputs.run_id }}" && git push)

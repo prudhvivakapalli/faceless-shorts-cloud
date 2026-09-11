@@ -1,0 +1,7 @@
+config.json
+client_secret.json
+token.json
+request.json
+output/
+*.pyc
+__pycache__/
